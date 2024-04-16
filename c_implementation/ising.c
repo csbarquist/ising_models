@@ -3,16 +3,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
+
+#define OUT_FILE "./ising_out.csv"
 
 #define EXTERNAL_FIELD 0       // strength of external magnetic field
 #define INTERACTION_STRENGTH 1 // + for ferromagnetic, - for anti-feromagnetic
 #define GRID_SIZE 40
 #define BOLTZMANN_SCALE 10000
 
-#define START_TEMP 1000
+#define START_TEMP 3
 #define END_TEMP 0
-#define TEMP_STEP -10
-#define LOOP_COUNT 10000 // Number of updates per temp
+#define TEMP_STEP 0.05
+#define LOOP_COUNT 1000 // Number of updates per temp
+
+#define PRINT_FLAG true
+#define PRINT_AFTER 500
+#define PRINT_TIMER 1 // Seconds waited after printing
 
 typedef struct Grid2D {
   size_t size;
@@ -22,16 +29,18 @@ typedef struct Grid2D {
 } Grid2D;
 
 typedef struct MeanStats {
-  float m;
-  float m2;
-  float E;
-  float E2;
+  double m;
+  double m2;
+  double E;
+  double E2;
+  int n; // Number of updates
 } MeanStats;
 
-typedef struct Deltas {
-  int delta_E;
-  int delta_M;
-} Deltas;
+typedef struct CurStats {
+  double m;
+  double E;
+} CurStats;
+
 void init_grid(Grid2D *pg, size_t grid_size, double field_strength,
                double interaction_strength) {
   int rand_int; //   storing random state
@@ -55,6 +64,11 @@ void init_grid(Grid2D *pg, size_t grid_size, double field_strength,
 }
 
 void clear_screan() { printf("\e[1;1H\e[2J"); }
+
+void print_stats(MeanStats *ms, CurStats *cs, double temp) {
+  printf("TEMP: %f\n<E>: %f\tE: %f\n<m>: %f\tm: %f\n", temp, ms->E, cs->E,
+         ms->m, cs->m);
+}
 
 void print_grid(Grid2D *pg) {
   for (int row = 0; row < pg->size; row++) {
@@ -142,7 +156,20 @@ double lattice_energy(Grid2D *pg) {
   return E;
 }
 
-bool boltzmann_coin(int delta_E, int temp) {
+void init_mean_stats(MeanStats *ms, Grid2D *pg) {
+  ms->m = (double)calc_magnetization(pg);
+  ms->m2 = pow(ms->m, 2);
+  ms->E = (double)lattice_energy(pg);
+  ms->E2 = pow(ms->E, 2);
+  ms->n = 1;
+}
+
+void init_cur_stats(CurStats *cs, Grid2D *pg) {
+  cs->m = (double)calc_magnetization(pg);
+  cs->E = (double)lattice_energy(pg);
+}
+
+bool boltzmann_coin(int delta_E, double temp) {
   // if return true then keep state
   int roll = rand() % BOLTZMANN_SCALE;
   int pass_val = floor(BOLTZMANN_SCALE * exp((-1.0 * delta_E) / temp));
@@ -152,30 +179,84 @@ bool boltzmann_coin(int delta_E, int temp) {
 
 void flip_spin(Grid2D *pg, int row, int col) { pg->position[row][col] *= -1; }
 
-Deltas *update_lattice(Grid2D *pg, Deltas *d, int temp) {
+void update_lattice(Grid2D *pg, CurStats *cs, double temp) {
   int rand_row = rand() % GRID_SIZE;
   int rand_col = rand() % GRID_SIZE;
-  int cur_E = site_energy_periodic(pg, rand_row, rand_col);
-  int delta_E;
+  double cur_E = site_energy_periodic(pg, rand_row, rand_col);
+  double delta_E;
+  double delta_m;
 
   flip_spin(pg, rand_row, rand_col); // Filp randomly chosen spin
   delta_E = site_energy_periodic(pg, rand_row, rand_col) - cur_E;
 
   // Update Diffs
-  d->delta_E = delta_E;
-  d->delta_M = 2 * pg->position[rand_row][rand_col];
+  delta_E = delta_E;
+  delta_m = 2.0 * pg->position[rand_row][rand_col];
 
+  // Heart of Metropolis method
+  // If change in energey is < 0 automatically accept change
+  // otherwise roll a weighted die.
   if (delta_E > 0 && !boltzmann_coin(delta_E, temp)) {
     flip_spin(pg, rand_row, rand_col);
-    d->delta_E = 0;
-    d->delta_M = 0;
+    delta_E = 0;
+    delta_m = 0;
   }
 
-  return d;
+  cs->E += delta_E;
+  cs->m += delta_m;
 }
 
-void temp_loop_simulation(Grid2D *pg) {
-  for (int temp = START_TEMP; temp) {
+void update_stats(MeanStats *ms, CurStats *cs) {
+  ms->m = ms->m * (ms->n) / (ms->n + 1) + cs->m / (ms->n + 1);
+  ms->E = ms->E * (ms->n) / (ms->n + 1) + cs->E / (ms->n + 1);
+  ms->m2 = ms->m2 * (ms->n) / (ms->n + 1) + pow(cs->m, 2) / (ms->n + 1);
+  ms->E2 = ms->E2 * (ms->n) / (ms->n + 1) + pow(cs->E, 2) / (ms->n + 1);
+}
+
+void simulate_temp(Grid2D *pg, MeanStats *ms, CurStats *cs, double temp) {
+  for (int i = 0; i < LOOP_COUNT; i++) {
+    update_lattice(pg, cs, temp);
+    update_stats(ms, cs);
+
+    if (PRINT_FLAG && (i % PRINT_AFTER == 0)) {
+      clear_screan();
+      print_grid(pg);
+      print_stats(ms, cs, temp);
+      sleep(PRINT_TIMER);
+    }
+  }
+}
+
+void init_file() {
+  FILE *fptr;
+  fptr = fopen(OUT_FILE, "w");
+  fprintf(fptr, "temp,<m>,<m2>,<E>,<E2>\n");
+  fclose(fptr);
+}
+
+void write_stats(MeanStats *ms, double temp) {
+  FILE *fptr;
+  fptr = fopen(OUT_FILE, "a");
+  fprintf(fptr, "%f,%f,%f,%f,%f\n", temp, ms->m, ms->m2, ms->E, ms->E2);
+  fclose(fptr);
+}
+
+void temp_loop_simulation(Grid2D *pg, CurStats *cs) {
+  int direction = END_TEMP - START_TEMP;
+  MeanStats ms;
+
+  if (direction > 0) {
+    for (float temp = START_TEMP; temp < END_TEMP; temp += TEMP_STEP) {
+      init_mean_stats(&ms, pg);
+      simulate_temp(pg, &ms, cs, temp);
+      write_stats(&ms, temp);
+    }
+  } else {
+    for (float temp = START_TEMP; temp > END_TEMP; temp -= TEMP_STEP) {
+      init_mean_stats(&ms, pg);
+      simulate_temp(pg, &ms, cs, temp);
+      write_stats(&ms, temp);
+    }
   }
 }
 
@@ -186,10 +267,14 @@ int main() {
   // Init grid
   Grid2D grid;
   init_grid(&grid, GRID_SIZE, EXTERNAL_FIELD, INTERACTION_STRENGTH);
-  print_grid(&grid);
 
-  double E = lattice_energy(&grid);
-  printf("Lattice Energy %f\n", E);
+  // Init Stats
+  CurStats cs;
+  init_cur_stats(&cs, &grid);
+  // Init File
+  init_file();
+  // Simulate
+  temp_loop_simulation(&grid, &cs);
 
   return 0;
 }
